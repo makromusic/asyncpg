@@ -2206,11 +2206,11 @@ def _detect_server_capabilities(server_version, connection_settings):
         sql_close_all = False
     else:
         # Standard PostgreSQL server assumed.
-        advisory_locks = True
-        notifications = True
-        plpgsql = True
-        sql_reset = True
-        sql_close_all = True
+        advisory_locks = False
+        notifications = False
+        plpgsql = False
+        sql_reset = False
+        sql_close_all = False
 
     return ServerCapabilities(
         advisory_locks=advisory_locks,
