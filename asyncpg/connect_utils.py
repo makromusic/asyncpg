@@ -18,6 +18,7 @@ import socket
 import ssl as ssl_module
 import stat
 import struct
+import sys
 import time
 import typing
 import urllib.parse
@@ -52,6 +53,7 @@ _ConnectionParameters = collections.namedtuple(
         'database',
         'ssl',
         'sslmode',
+        'direct_tls',
         'connect_timeout',
         'server_settings',
     ])
@@ -196,11 +198,25 @@ def _parse_hostlist(hostlist, port, *, unquote=False):
         port = _validate_port_spec(hostspecs, port)
 
     for i, hostspec in enumerate(hostspecs):
-        if not hostspec.startswith('/'):
-            addr, _, hostspec_port = hostspec.partition(':')
-        else:
+        if hostspec[0] == '/':
+            # Unix socket
             addr = hostspec
             hostspec_port = ''
+        elif hostspec[0] == '[':
+            # IPv6 address
+            m = re.match(r'(?:\[([^\]]+)\])(?::([0-9]+))?', hostspec)
+            if m:
+                addr = m.group(1)
+                hostspec_port = m.group(2)
+            else:
+                raise ValueError(
+                    'invalid IPv6 address in the connection URI: {!r}'.format(
+                        hostspec
+                    )
+                )
+        else:
+            # IPv4 address
+            addr, _, hostspec_port = hostspec.partition(':')
 
         if unquote:
             addr = urllib.parse.unquote(addr)
@@ -220,12 +236,35 @@ def _parse_hostlist(hostlist, port, *, unquote=False):
     return hosts, port
 
 
+def _parse_tls_version(tls_version):
+    if not hasattr(ssl_module, 'TLSVersion'):
+        raise ValueError(
+            "TLSVersion is not supported in this version of Python"
+        )
+    if tls_version.startswith('SSL'):
+        raise ValueError(
+            f"Unsupported TLS version: {tls_version}"
+        )
+    try:
+        return ssl_module.TLSVersion[tls_version.replace('.', '_')]
+    except KeyError:
+        raise ValueError(
+            f"No such TLS version: {tls_version}"
+        )
+
+
+def _dot_postgresql_path(filename) -> pathlib.Path:
+    return (pathlib.Path.home() / '.postgresql' / filename).resolve()
+
+
 def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                                 password, passfile, database, ssl,
-                                connect_timeout, server_settings):
+                                direct_tls, connect_timeout, server_settings):
     # `auth_hosts` is the version of host information for the purposes
     # of reading the pgpass file.
     auth_hosts = None
+    sslcert = sslkey = sslrootcert = sslcrl = sslpassword = None
+    ssl_min_protocol_version = ssl_max_protocol_version = None
 
     if dsn:
         parsed = urllib.parse.urlparse(dsn)
@@ -309,6 +348,31 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                 val = query.pop('sslmode')
                 if ssl is None:
                     ssl = val
+
+            if 'sslcert' in query:
+                sslcert = query.pop('sslcert')
+
+            if 'sslkey' in query:
+                sslkey = query.pop('sslkey')
+
+            if 'sslrootcert' in query:
+                sslrootcert = query.pop('sslrootcert')
+
+            if 'sslcrl' in query:
+                sslcrl = query.pop('sslcrl')
+
+            if 'sslpassword' in query:
+                sslpassword = query.pop('sslpassword')
+
+            if 'ssl_min_protocol_version' in query:
+                ssl_min_protocol_version = query.pop(
+                    'ssl_min_protocol_version'
+                )
+
+            if 'ssl_max_protocol_version' in query:
+                ssl_max_protocol_version = query.pop(
+                    'ssl_max_protocol_version'
+                )
 
             if query:
                 if server_settings is None:
@@ -427,15 +491,101 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                 '`sslmode` parameter must be one of: {}'.format(modes))
 
         # docs at https://www.postgresql.org/docs/10/static/libpq-connect.html
-        # Not implemented: sslcert & sslkey & sslrootcert & sslcrl params.
         if sslmode < SSLMode.allow:
             ssl = False
         else:
-            ssl = ssl_module.create_default_context()
+            ssl = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_CLIENT)
             ssl.check_hostname = sslmode >= SSLMode.verify_full
-            ssl.verify_mode = ssl_module.CERT_REQUIRED
-            if sslmode <= SSLMode.require:
+            if sslmode < SSLMode.require:
                 ssl.verify_mode = ssl_module.CERT_NONE
+            else:
+                if sslrootcert is None:
+                    sslrootcert = os.getenv('PGSSLROOTCERT')
+                if sslrootcert:
+                    ssl.load_verify_locations(cafile=sslrootcert)
+                    ssl.verify_mode = ssl_module.CERT_REQUIRED
+                else:
+                    sslrootcert = _dot_postgresql_path('root.crt')
+                    try:
+                        ssl.load_verify_locations(cafile=sslrootcert)
+                    except FileNotFoundError:
+                        if sslmode > SSLMode.require:
+                            raise ValueError(
+                                f'root certificate file "{sslrootcert}" does '
+                                f'not exist\nEither provide the file or '
+                                f'change sslmode to disable server '
+                                f'certificate verification.'
+                            )
+                        elif sslmode == SSLMode.require:
+                            ssl.verify_mode = ssl_module.CERT_NONE
+                        else:
+                            assert False, 'unreachable'
+                    else:
+                        ssl.verify_mode = ssl_module.CERT_REQUIRED
+
+                if sslcrl is None:
+                    sslcrl = os.getenv('PGSSLCRL')
+                if sslcrl:
+                    ssl.load_verify_locations(cafile=sslcrl)
+                    ssl.verify_flags |= ssl_module.VERIFY_CRL_CHECK_CHAIN
+                else:
+                    sslcrl = _dot_postgresql_path('root.crl')
+                    try:
+                        ssl.load_verify_locations(cafile=sslcrl)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        ssl.verify_flags |= ssl_module.VERIFY_CRL_CHECK_CHAIN
+
+            if sslkey is None:
+                sslkey = os.getenv('PGSSLKEY')
+            if not sslkey:
+                sslkey = _dot_postgresql_path('postgresql.key')
+                if not sslkey.exists():
+                    sslkey = None
+            if not sslpassword:
+                sslpassword = ''
+            if sslcert is None:
+                sslcert = os.getenv('PGSSLCERT')
+            if sslcert:
+                ssl.load_cert_chain(
+                    sslcert, keyfile=sslkey, password=lambda: sslpassword
+                )
+            else:
+                sslcert = _dot_postgresql_path('postgresql.crt')
+                try:
+                    ssl.load_cert_chain(
+                        sslcert, keyfile=sslkey, password=lambda: sslpassword
+                    )
+                except FileNotFoundError:
+                    pass
+
+            # OpenSSL 1.1.1 keylog file, copied from create_default_context()
+            if hasattr(ssl, 'keylog_filename'):
+                keylogfile = os.environ.get('SSLKEYLOGFILE')
+                if keylogfile and not sys.flags.ignore_environment:
+                    ssl.keylog_filename = keylogfile
+
+            if ssl_min_protocol_version is None:
+                ssl_min_protocol_version = os.getenv('PGSSLMINPROTOCOLVERSION')
+            if ssl_min_protocol_version:
+                ssl.minimum_version = _parse_tls_version(
+                    ssl_min_protocol_version
+                )
+            else:
+                try:
+                    ssl.minimum_version = _parse_tls_version('TLSv1.2')
+                except ValueError:
+                    # Python 3.6 does not have ssl.TLSVersion
+                    pass
+
+            if ssl_max_protocol_version is None:
+                ssl_max_protocol_version = os.getenv('PGSSLMAXPROTOCOLVERSION')
+            if ssl_max_protocol_version:
+                ssl.maximum_version = _parse_tls_version(
+                    ssl_max_protocol_version
+                )
+
     elif ssl is True:
         ssl = ssl_module.create_default_context()
         sslmode = SSLMode.verify_full
@@ -452,8 +602,8 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
-        sslmode=sslmode, connect_timeout=connect_timeout,
-        server_settings=server_settings)
+        sslmode=sslmode, direct_tls=direct_tls,
+        connect_timeout=connect_timeout, server_settings=server_settings)
 
     return addrs, params
 
@@ -463,7 +613,7 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
                              statement_cache_size,
                              max_cached_statement_lifetime,
                              max_cacheable_statement_size,
-                             ssl, server_settings):
+                             ssl, direct_tls, server_settings):
 
     local_vars = locals()
     for var_name in {'max_cacheable_statement_size',
@@ -491,8 +641,8 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
     addrs, params = _parse_connect_dsn_and_args(
         dsn=dsn, host=host, port=port, user=user,
         password=password, passfile=passfile, ssl=ssl,
-        database=database, connect_timeout=timeout,
-        server_settings=server_settings)
+        direct_tls=direct_tls, database=database,
+        connect_timeout=timeout, server_settings=server_settings)
 
     config = _ClientConfiguration(
         command_timeout=command_timeout,
@@ -608,10 +758,9 @@ async def _connect_addr(
 
     params_input = params
     if callable(params.password):
-        if inspect.iscoroutinefunction(params.password):
-            password = await params.password()
-        else:
-            password = params.password()
+        password = params.password()
+        if inspect.isawaitable(password):
+            password = await password
 
         params = params._replace(password=password)
     args = (addr, loop, config, connection_class, record_class, params_input)
@@ -664,6 +813,14 @@ async def __connect_addr(
     if isinstance(addr, str):
         # UNIX socket
         connector = loop.create_unix_connection(proto_factory, addr)
+
+    elif params.ssl and params.direct_tls:
+        # if ssl and direct_tls are given, skip STARTTLS and perform direct
+        # SSL connection
+        connector = loop.create_connection(
+            proto_factory, *addr, ssl=params.ssl
+        )
+
     elif params.ssl:
         connector = _create_ssl_connection(
             proto_factory, *addr, loop=loop, ssl_context=params.ssl,

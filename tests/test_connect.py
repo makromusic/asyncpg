@@ -9,12 +9,18 @@ import asyncio
 import contextlib
 import ipaddress
 import os
+import pathlib
 import platform
+import shutil
 import ssl
 import stat
+import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
+import urllib.parse
+import warnings
 import weakref
 
 import asyncpg
@@ -31,8 +37,39 @@ _system = platform.uname().system
 
 CERTS = os.path.join(os.path.dirname(__file__), 'certs')
 SSL_CA_CERT_FILE = os.path.join(CERTS, 'ca.cert.pem')
+SSL_CA_CRL_FILE = os.path.join(CERTS, 'ca.crl.pem')
 SSL_CERT_FILE = os.path.join(CERTS, 'server.cert.pem')
 SSL_KEY_FILE = os.path.join(CERTS, 'server.key.pem')
+CLIENT_CA_CERT_FILE = os.path.join(CERTS, 'client_ca.cert.pem')
+CLIENT_SSL_CERT_FILE = os.path.join(CERTS, 'client.cert.pem')
+CLIENT_SSL_KEY_FILE = os.path.join(CERTS, 'client.key.pem')
+CLIENT_SSL_PROTECTED_KEY_FILE = os.path.join(CERTS, 'client.key.protected.pem')
+
+
+@contextlib.contextmanager
+def mock_dot_postgresql(*, ca=True, crl=False, client=False, protected=False):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        home = pathlib.Path(temp_dir)
+        pg_home = home / '.postgresql'
+        pg_home.mkdir()
+        if ca:
+            shutil.copyfile(SSL_CA_CERT_FILE, pg_home / 'root.crt')
+        if crl:
+            shutil.copyfile(SSL_CA_CRL_FILE, pg_home / 'root.crl')
+        if client:
+            shutil.copyfile(CLIENT_SSL_CERT_FILE, pg_home / 'postgresql.crt')
+            if protected:
+                shutil.copyfile(
+                    CLIENT_SSL_PROTECTED_KEY_FILE, pg_home / 'postgresql.key'
+                )
+            else:
+                shutil.copyfile(
+                    CLIENT_SSL_KEY_FILE, pg_home / 'postgresql.key'
+                )
+        with unittest.mock.patch(
+            'pathlib.Path.home', unittest.mock.Mock(return_value=home)
+        ):
+            yield
 
 
 class TestSettings(tb.ConnectedTestCase):
@@ -64,6 +101,9 @@ class TestSettings(tb.ConnectedTestCase):
             ("10.1", (10, 0, 1, 'final', 0),),
             ("11.1.2", (11, 0, 1, 'final', 0),),
             ("PostgreSQL 10.1 (Debian 10.1-3)", (10, 0, 1, 'final', 0),),
+            ("PostgreSQL 11.2-YB-2.7.1.1-b0 on x86_64-pc-linux-gnu, "
+             "compiled by gcc (Homebrew gcc 5.5.0_4) 5.5.0, 64-bit",
+             (11, 0, 2, "final", 0),),
         ]
         for version, expected in versions:
             result = split_server_version_string(version)
@@ -242,6 +282,25 @@ class TestAuthentication(tb.ConnectedTestCase):
                 user='password_user',
                 password=get_wrongpassword)
 
+    async def test_auth_password_cleartext_callable_awaitable(self):
+        async def get_correctpassword():
+            return 'correctpassword'
+
+        async def get_wrongpassword():
+            return 'wrongpassword'
+
+        conn = await self.connect(
+            user='password_user',
+            password=lambda: get_correctpassword())
+        await conn.close()
+
+        with self.assertRaisesRegex(
+                asyncpg.InvalidPasswordError,
+                'password authentication failed for user "password_user"'):
+            await self._try_connect(
+                user='password_user',
+                password=lambda: get_wrongpassword())
+
     async def test_auth_password_md5(self):
         conn = await self.connect(
             user='md5_user', password='correctpassword')
@@ -300,8 +359,13 @@ class TestAuthentication(tb.ConnectedTestCase):
         await self.con.execute(alter_password)
         await self.con.execute("SET password_encryption = 'md5';")
 
-    async def test_auth_unsupported(self):
-        pass
+    @unittest.mock.patch('hashlib.md5', side_effect=ValueError("no md5"))
+    async def test_auth_md5_unsupported(self, _):
+        with self.assertRaisesRegex(
+            exceptions.InternalClientError,
+            ".*no md5.*",
+        ):
+            await self.connect(user='md5_user', password='correctpassword')
 
 
 class TestConnectParams(tb.TestCase):
@@ -470,6 +534,34 @@ class TestConnectParams(tb.TestCase):
                 'user': 'user',
             })
         },
+
+        {
+            'name': 'dsn_ipv6_multi_host',
+            'dsn': 'postgresql://user@[2001:db8::1234%25eth0],[::1]/db',
+            'result': ([('2001:db8::1234%eth0', 5432), ('::1', 5432)], {
+                'database': 'db',
+                'user': 'user',
+            })
+        },
+
+        {
+            'name': 'dsn_ipv6_multi_host_port',
+            'dsn': 'postgresql://user@[2001:db8::1234]:1111,[::1]:2222/db',
+            'result': ([('2001:db8::1234', 1111), ('::1', 2222)], {
+                'database': 'db',
+                'user': 'user',
+            })
+        },
+
+        {
+            'name': 'dsn_ipv6_multi_host_query_part',
+            'dsn': 'postgresql:///db?user=user&host=[2001:db8::1234],[::1]',
+            'result': ([('2001:db8::1234', 5432), ('::1', 5432)], {
+                'database': 'db',
+                'user': 'user',
+            })
+        },
+
 
         {
             'name': 'dsn_combines_env_multi_host',
@@ -719,7 +811,8 @@ class TestConnectParams(tb.TestCase):
             addrs, params = connect_utils._parse_connect_dsn_and_args(
                 dsn=dsn, host=host, port=port, user=user, password=password,
                 passfile=passfile, database=database, ssl=sslmode,
-                connect_timeout=None, server_settings=server_settings)
+                direct_tls=False, connect_timeout=None,
+                server_settings=server_settings)
 
             params = {
                 k: v for k, v in params._asdict().items()
@@ -737,6 +830,10 @@ class TestConnectParams(tb.TestCase):
                 # unless explicitly tested for.
                 params.pop('ssl', None)
                 params.pop('sslmode', None)
+            if 'direct_tls' not in expected[1]:
+                # Avoid the hassle of specifying direct_tls
+                # unless explicitly tested for
+                params.pop('direct_tls', False)
 
             self.assertEqual(expected, result, 'Testcase: {}'.format(testcase))
 
@@ -1105,7 +1202,7 @@ class TestConnection(tb.ConnectedTestCase):
 
     @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
     async def test_connection_ssl_to_no_ssl_server(self):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.load_verify_locations(SSL_CA_CERT_FILE)
 
         with self.assertRaisesRegex(ConnectionError, 'rejected SSL'):
@@ -1121,6 +1218,8 @@ class TestConnection(tb.ConnectedTestCase):
             try:
                 con = await self.connect(
                     dsn='postgresql://foo/?sslmode=' + sslmode,
+                    user='postgres',
+                    database='postgres',
                     host='localhost')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
                 self.assertFalse(con._protocol.is_ssl)
@@ -1134,6 +1233,8 @@ class TestConnection(tb.ConnectedTestCase):
                 with self.assertRaises(ConnectionError):
                     con = await self.connect(
                         dsn='postgresql://foo/?sslmode=' + sslmode,
+                        user='postgres',
+                        database='postgres',
                         host='localhost')
                     await con.fetchval('SELECT 42')
             finally:
@@ -1144,8 +1245,10 @@ class TestConnection(tb.ConnectedTestCase):
         await verify_works('allow')
         await verify_works('prefer')
         await verify_fails('require')
-        await verify_fails('verify-ca')
-        await verify_fails('verify-full')
+        with mock_dot_postgresql():
+            await verify_fails('require')
+            await verify_fails('verify-ca')
+            await verify_fails('verify-full')
 
     async def test_connection_implicit_host(self):
         conn_spec = self.get_connection_spec()
@@ -1164,7 +1267,11 @@ class BaseTestSSLConnection(tb.ConnectedTestCase):
             'ssl': 'on',
             'ssl_cert_file': SSL_CERT_FILE,
             'ssl_key_file': SSL_KEY_FILE,
+            'ssl_ca_file': CLIENT_CA_CERT_FILE,
         })
+        if cls.cluster.get_pg_version() >= (12, 0):
+            conf['ssl_min_protocol_version'] = 'TLSv1.2'
+            conf['ssl_max_protocol_version'] = 'TLSv1.2'
 
         return conf
 
@@ -1219,7 +1326,7 @@ class TestSSLConnection(BaseTestSSLConnection):
             auth_method='trust')
 
     async def test_ssl_connection_custom_context(self):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.load_verify_locations(SSL_CA_CERT_FILE)
 
         con = await self.connect(
@@ -1242,7 +1349,7 @@ class TestSSLConnection(BaseTestSSLConnection):
             con = None
             try:
                 con = await self.connect(
-                    dsn='postgresql://foo/?sslmode=' + sslmode,
+                    dsn='postgresql://foo/postgres?sslmode=' + sslmode,
                     host=host,
                     user='ssl_user')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
@@ -1251,8 +1358,7 @@ class TestSSLConnection(BaseTestSSLConnection):
                 if con:
                     await con.close()
 
-        async def verify_fails(sslmode, *, host='localhost',
-                               exn_type=ssl.SSLError):
+        async def verify_fails(sslmode, *, host='localhost', exn_type):
             # XXX: uvloop artifact
             old_handler = self.loop.get_exception_handler()
             con = None
@@ -1274,23 +1380,29 @@ class TestSSLConnection(BaseTestSSLConnection):
         await verify_works('allow')
         await verify_works('prefer')
         await verify_works('require')
-        await verify_fails('verify-ca')
-        await verify_fails('verify-full')
+        await verify_fails('verify-ca', exn_type=ValueError)
+        await verify_fails('verify-full', exn_type=ValueError)
 
-        orig_create_default_context = ssl.create_default_context
-        try:
-            def custom_create_default_context(*args, **kwargs):
-                ctx = orig_create_default_context(*args, **kwargs)
-                ctx.load_verify_locations(cafile=SSL_CA_CERT_FILE)
-                return ctx
-            ssl.create_default_context = custom_create_default_context
+        with mock_dot_postgresql():
+            await verify_works('require')
             await verify_works('verify-ca')
             await verify_works('verify-ca', host='127.0.0.1')
             await verify_works('verify-full')
             await verify_fails('verify-full', host='127.0.0.1',
                                exn_type=ssl.CertificateError)
-        finally:
-            ssl.create_default_context = orig_create_default_context
+
+        with mock_dot_postgresql(crl=True):
+            await verify_fails('disable', exn_type=invalid_auth_err)
+            await verify_works('allow')
+            await verify_works('prefer')
+            await verify_fails('require',
+                               exn_type=ssl.SSLError)
+            await verify_fails('verify-ca',
+                               exn_type=ssl.SSLError)
+            await verify_fails('verify-ca', host='127.0.0.1',
+                               exn_type=ssl.SSLError)
+            await verify_fails('verify-full',
+                               exn_type=ssl.SSLError)
 
     async def test_ssl_connection_default_context(self):
         # XXX: uvloop artifact
@@ -1306,7 +1418,7 @@ class TestSSLConnection(BaseTestSSLConnection):
             self.loop.set_exception_handler(old_handler)
 
     async def test_ssl_connection_pool(self):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.load_verify_locations(SSL_CA_CERT_FILE)
 
         pool = await self.create_pool(
@@ -1331,7 +1443,7 @@ class TestSSLConnection(BaseTestSSLConnection):
         await pool.close()
 
     async def test_executemany_uvloop_ssl_issue_700(self):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.load_verify_locations(SSL_CA_CERT_FILE)
 
         con = await self.connect(
@@ -1354,6 +1466,153 @@ class TestSSLConnection(BaseTestSSLConnection):
             finally:
                 await con.close()
 
+    @unittest.skipIf(
+        sys.version_info < (3, 7),
+        "Python < 3.7 doesn't have ssl.TLSVersion"
+    )
+    async def test_tls_version(self):
+        if self.cluster.get_pg_version() < (12, 0):
+            self.skipTest("PostgreSQL < 12 cannot set ssl protocol version")
+
+        # XXX: uvloop artifact
+        old_handler = self.loop.get_exception_handler()
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="ssl.TLSVersion.TLSv1_1 is deprecated",
+                category=DeprecationWarning
+            )
+            try:
+                self.loop.set_exception_handler(lambda *args: None)
+                with self.assertRaisesRegex(
+                    ssl.SSLError,
+                    '(protocol version)|(handshake failure)',
+                ):
+                    await self.connect(
+                        dsn='postgresql://ssl_user@localhost/postgres'
+                            '?sslmode=require&ssl_min_protocol_version=TLSv1.3'
+                    )
+                with self.assertRaises((ssl.SSLError, ConnectionResetError)):
+                    await self.connect(
+                        dsn='postgresql://ssl_user@localhost/postgres'
+                            '?sslmode=require'
+                            '&ssl_min_protocol_version=TLSv1.1'
+                            '&ssl_max_protocol_version=TLSv1.1'
+                    )
+                with self.assertRaisesRegex(ssl.SSLError, 'no protocols'):
+                    await self.connect(
+                        dsn='postgresql://ssl_user@localhost/postgres'
+                            '?sslmode=require'
+                            '&ssl_min_protocol_version=TLSv1.2'
+                            '&ssl_max_protocol_version=TLSv1.1'
+                    )
+                con = await self.connect(
+                    dsn='postgresql://ssl_user@localhost/postgres'
+                        '?sslmode=require'
+                        '&ssl_min_protocol_version=TLSv1.2'
+                        '&ssl_max_protocol_version=TLSv1.2'
+                )
+                try:
+                    self.assertEqual(await con.fetchval('SELECT 42'), 42)
+                finally:
+                    await con.close()
+            finally:
+                self.loop.set_exception_handler(old_handler)
+
+
+@unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
+class TestClientSSLConnection(BaseTestSSLConnection):
+    def _add_hba_entry(self):
+        self.cluster.add_hba_entry(
+            type='hostssl', address=ipaddress.ip_network('127.0.0.0/24'),
+            database='postgres', user='ssl_user',
+            auth_method='cert')
+
+        self.cluster.add_hba_entry(
+            type='hostssl', address=ipaddress.ip_network('::1/128'),
+            database='postgres', user='ssl_user',
+            auth_method='cert')
+
+    async def test_ssl_connection_client_auth_fails_with_wrong_setup(self):
+        ssl_context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=SSL_CA_CERT_FILE,
+        )
+
+        with self.assertRaisesRegex(
+            exceptions.InvalidAuthorizationSpecificationError,
+            "requires a valid client certificate",
+        ):
+            await self.connect(
+                host='localhost',
+                user='ssl_user',
+                ssl=ssl_context,
+            )
+
+    async def _test_works(self, **conn_args):
+        con = await self.connect(**conn_args)
+
+        try:
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_ssl_connection_client_auth_custom_context(self):
+        for key_file in (CLIENT_SSL_KEY_FILE, CLIENT_SSL_PROTECTED_KEY_FILE):
+            ssl_context = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH,
+                cafile=SSL_CA_CERT_FILE,
+            )
+            ssl_context.load_cert_chain(
+                CLIENT_SSL_CERT_FILE,
+                keyfile=key_file,
+                password='secRet',
+            )
+            await self._test_works(
+                host='localhost',
+                user='ssl_user',
+                ssl=ssl_context,
+            )
+
+    async def test_ssl_connection_client_auth_dsn(self):
+        params = {
+            'sslrootcert': SSL_CA_CERT_FILE,
+            'sslcert': CLIENT_SSL_CERT_FILE,
+            'sslkey': CLIENT_SSL_KEY_FILE,
+            'sslmode': 'verify-full',
+        }
+        params_str = urllib.parse.urlencode(params)
+        dsn = 'postgres://ssl_user@localhost/postgres?' + params_str
+        await self._test_works(dsn=dsn)
+
+        params['sslkey'] = CLIENT_SSL_PROTECTED_KEY_FILE
+        params['sslpassword'] = 'secRet'
+        params_str = urllib.parse.urlencode(params)
+        dsn = 'postgres://ssl_user@localhost/postgres?' + params_str
+        await self._test_works(dsn=dsn)
+
+    async def test_ssl_connection_client_auth_env(self):
+        env = {
+            'PGSSLROOTCERT': SSL_CA_CERT_FILE,
+            'PGSSLCERT': CLIENT_SSL_CERT_FILE,
+            'PGSSLKEY': CLIENT_SSL_KEY_FILE,
+        }
+        dsn = 'postgres://ssl_user@localhost/postgres?sslmode=verify-full'
+        with unittest.mock.patch.dict('os.environ', env):
+            await self._test_works(dsn=dsn)
+
+        env['PGSSLKEY'] = CLIENT_SSL_PROTECTED_KEY_FILE
+        with unittest.mock.patch.dict('os.environ', env):
+            await self._test_works(dsn=dsn + '&sslpassword=secRet')
+
+    async def test_ssl_connection_client_auth_dot_postgresql(self):
+        dsn = 'postgres://ssl_user@localhost/postgres?sslmode=verify-full'
+        with mock_dot_postgresql(client=True):
+            await self._test_works(dsn=dsn)
+        with mock_dot_postgresql(client=True, protected=True):
+            await self._test_works(dsn=dsn + '&sslpassword=secRet')
+
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
 class TestNoSSLConnection(BaseTestSSLConnection):
@@ -1373,7 +1632,7 @@ class TestNoSSLConnection(BaseTestSSLConnection):
             con = None
             try:
                 con = await self.connect(
-                    dsn='postgresql://foo/?sslmode=' + sslmode,
+                    dsn='postgresql://foo/postgres?sslmode=' + sslmode,
                     host=host,
                     user='ssl_user')
                 self.assertEqual(await con.fetchval('SELECT 42'), 42)
@@ -1382,14 +1641,15 @@ class TestNoSSLConnection(BaseTestSSLConnection):
                 if con:
                     await con.close()
 
-        async def verify_fails(sslmode, *, host='localhost',
-                               exn_type=ssl.SSLError):
+        async def verify_fails(sslmode, *, host='localhost'):
             # XXX: uvloop artifact
             old_handler = self.loop.get_exception_handler()
             con = None
             try:
                 self.loop.set_exception_handler(lambda *args: None)
-                with self.assertRaises(exn_type):
+                with self.assertRaises(
+                        asyncpg.InvalidAuthorizationSpecificationError
+                ):
                     con = await self.connect(
                         dsn='postgresql://foo/?sslmode=' + sslmode,
                         host=host,
@@ -1400,24 +1660,28 @@ class TestNoSSLConnection(BaseTestSSLConnection):
                     await con.close()
                 self.loop.set_exception_handler(old_handler)
 
-        invalid_auth_err = asyncpg.InvalidAuthorizationSpecificationError
         await verify_works('disable')
         await verify_works('allow')
         await verify_works('prefer')
-        await verify_fails('require', exn_type=invalid_auth_err)
-        await verify_fails('verify-ca')
-        await verify_fails('verify-full')
+        await verify_fails('require')
+        with mock_dot_postgresql():
+            await verify_fails('require')
+            await verify_fails('verify-ca')
+            await verify_fails('verify-full')
 
     async def test_nossl_connection_prefer_cancel(self):
         con = await self.connect(
-            dsn='postgresql://foo/?sslmode=prefer',
+            dsn='postgresql://foo/postgres?sslmode=prefer',
             host='localhost',
             user='ssl_user')
-        self.assertFalse(con._protocol.is_ssl)
-        with self.assertRaises(asyncio.TimeoutError):
-            await con.execute('SELECT pg_sleep(5)', timeout=0.5)
-        val = await con.fetchval('SELECT 123')
-        self.assertEqual(val, 123)
+        try:
+            self.assertFalse(con._protocol.is_ssl)
+            with self.assertRaises(asyncio.TimeoutError):
+                await con.execute('SELECT pg_sleep(5)', timeout=0.5)
+            val = await con.fetchval('SELECT 123')
+            self.assertEqual(val, 123)
+        finally:
+            await con.close()
 
     async def test_nossl_connection_pool(self):
         pool = await self.create_pool(
